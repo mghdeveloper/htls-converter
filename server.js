@@ -2,169 +2,153 @@ import express from "express";
 import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
-import { spawn } from "child_process";
+import { exec } from "child_process";
+import { fileURLToPath } from "url";
 import crypto from "crypto";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const JOBS_DIR = path.resolve("./jobs");
-if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR, { recursive: true });
 
-// ===================== HELPERS =====================
-function logError(msg, err = null) {
-  const logLine = `[${new Date().toISOString()}] ${msg} ${
-    err ? JSON.stringify(err) : ""
-  }\n`;
-  console.error(logLine);
-  fs.appendFileSync(path.join(JOBS_DIR, "errors.log"), logLine);
+// In-memory job store
+const jobs = {}; // { jobId: { status, progress, total, downloaded, file, error } }
+
+// ===== HELPERS =====
+function generateJobId() {
+  return Date.now().toString() + Math.floor(Math.random() * 10000);
 }
 
-function sanitizeFileName(name) {
-  return name.replace(/[^a-z0-9_\-\.]/gi, "_");
+async function fetchText(url) {
+  const res = await fetch(url, { timeout: 120000 });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return await res.text();
 }
 
-function encryptUrl(url) {
-  const ENC_KEY = "CHANGE_THIS_TO_RANDOM_32_CHAR_SECRET_KEY_123456";
-  const ENC_METHOD = "aes-256-cbc";
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ENC_METHOD, ENC_KEY, iv);
-  const encrypted = Buffer.concat([cipher.update(url), cipher.final()]);
-  return Buffer.concat([iv, encrypted]).toString("base64");
-}
-
-async function downloadSegment(url, dest) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buffer = await res.arrayBuffer();
-      fs.writeFileSync(dest, Buffer.from(buffer));
-      return;
-    } catch (err) {
-      logError(`Segment download failed (${attempt}/3): ${url}`, err);
-      if (attempt === 3) throw err;
-    }
-  }
-}
-
-function createConcatList(dir, total) {
-  const listFile = path.join(dir, "list.txt");
-  const content = Array.from({ length: total })
-    .map((_, i) => `file '${path.join(dir, `${i}.ts`)}'`)
-    .join("\n");
-  fs.writeFileSync(listFile, content);
-  return listFile;
-}
-
-function convertToMp4(listFile, output) {
+async function downloadFile(url, dest) {
+  const res = await fetch(url, { timeout: 120000 });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", [
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      listFile,
-      "-c",
-      "copy",
-      "-movflags",
-      "+faststart",
-      output,
-    ]);
-
-    ffmpeg.stderr.on("data", (d) => console.log(d.toString()));
-
-    ffmpeg.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error("FFmpeg failed with code " + code));
-    });
+    const fileStream = fs.createWriteStream(dest);
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
   });
 }
 
-// ===================== JOB MANAGEMENT =====================
-const jobs = {};
+// ===== JOB WORKER =====
+async function processJob(jobId, m3u8Url) {
+  const job = jobs[jobId];
+  try {
+    job.status = "downloading";
 
-function updateJob(id, data) {
-  if (!jobs[id]) jobs[id] = {};
-  Object.assign(jobs[id], data);
+    const tmpDir = path.join(__dirname, "tmp", jobId);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // Fetch master playlist
+    const masterContent = await fetchText(m3u8Url);
+    const lines = masterContent.split("\n");
+
+    // Extract .ts segment URLs
+    const segments = lines.filter(l => l.trim() && !l.startsWith("#"));
+    job.total = segments.length;
+    job.downloaded = 0;
+
+    const localPlaylist = [];
+    for (let i = 0; i < segments.length; i++) {
+      const segUrl = segments[i].startsWith("http")
+        ? segments[i]
+        : new URL(segments[i], m3u8Url).href;
+
+      const segName = `seg_${i}.ts`;
+      const segPath = path.join(tmpDir, segName);
+
+      await downloadFile(segUrl, segPath);
+      localPlaylist.push(segName);
+
+      job.downloaded = i + 1;
+      job.progress = `${Math.floor(((i + 1) / segments.length) * 100)}%`;
+    }
+
+    // Save local playlist
+    const localM3u8 = path.join(tmpDir, "local.m3u8");
+    const m3u8Data = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:3",
+      "#EXT-X-TARGETDURATION:10",
+      "#EXT-X-MEDIA-SEQUENCE:0",
+      ...localPlaylist.map(seg => `#EXTINF:10.0,\n${seg}`),
+      "#EXT-X-ENDLIST"
+    ].join("\n");
+    fs.writeFileSync(localM3u8, m3u8Data);
+
+    // Run FFmpeg to convert to MP4
+    const outputFile = path.join(tmpDir, "video.mp4");
+    await new Promise((resolve, reject) => {
+      exec(
+        `ffmpeg -y -protocol_whitelist file,http,https,tcp,tls -i "${localM3u8}" -c copy "${outputFile}"`,
+        (err, stdout, stderr) => {
+          if (err) return reject(new Error(stderr));
+          resolve();
+        }
+      );
+    });
+
+    job.status = "done";
+    job.file = outputFile;
+    job.progress = "100%";
+  } catch (err) {
+    console.error("Job error:", err);
+    job.status = "error";
+    job.error = err.message;
+  }
 }
 
-// ===================== ROUTES =====================
+// ===== ROUTES =====
 
-// 1️⃣ Submit job
-app.post("/convert", async (req, res) => {
-  try {
-    const { episode_id } = req.body;
-    if (!episode_id) return res.status(400).json({ error: "Missing episode_id" });
+// Start job
+app.get("/start", async (req, res) => {
+  const { episode_id, m3u8 } = req.query;
+  if (!episode_id || !m3u8) return res.json({ error: "Missing episode_id or m3u8" });
 
-    const jobId = Date.now().toString();
-    const jobDir = path.join(JOBS_DIR, sanitizeFileName(jobId));
-    if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir, { recursive: true });
+  const jobId = generateJobId();
+  jobs[jobId] = {
+    status: "queued",
+    progress: "0%",
+    total: 0,
+    downloaded: 0,
+    file: null,
+    error: null
+  };
 
-    const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
+  // Start worker asynchronously
+  processJob(jobId, m3u8);
 
-    updateJob(jobId, { id: jobId, status: "queued", progress: "0%", total: 0, downloaded: 0, file: null, m3u8: masterUrl });
-
-    res.json({ id: jobId });
-
-    // start processing asynchronously
-    processJob(jobId, masterUrl, jobDir);
-  } catch (err) {
-    logError("Convert endpoint error", err);
-    res.status(500).json({ error: "Server error" });
-  }
+  res.json({ id: jobId, status: "queued" });
 });
 
-// 2️⃣ Job progress
-app.get("/progress/:id", (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).json({ error: "Job not found" });
+// Progress
+app.get("/progress/:jobId", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.json({ error: "Invalid jobId" });
   res.json(job);
 });
 
-// ===================== JOB PROCESSING =====================
-async function processJob(jobId, masterUrl, jobDir) {
-  try {
-    updateJob(jobId, { status: "downloading" });
+// Download
+app.get("/download/:jobId", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.json({ error: "Invalid jobId" });
+  if (job.status !== "done") return res.json({ error: "Job not finished" });
 
-    const masterRes = await fetch(masterUrl);
-    if (!masterRes.ok) throw new Error("Master.m3u8 fetch failed");
-    const masterText = await masterRes.text();
-    const lines = masterText.split("\n").filter((l) => !l.startsWith("#EXT-X-I-FRAME"));
-
-    // extract segments
-    const segmentUrls = lines.filter((l) => l && !l.startsWith("#"));
-    updateJob(jobId, { total: segmentUrls.length });
-
-    // download segments
-    let downloaded = 0;
-    for (let i = 0; i < segmentUrls.length; i++) {
-      const url = segmentUrls[i].startsWith("http")
-        ? segmentUrls[i]
-        : new URL(segmentUrls[i], masterUrl).href;
-      const dest = path.join(jobDir, `${i}.ts`);
-      await downloadSegment(url, dest);
-      downloaded++;
-      updateJob(jobId, { progress: `${Math.floor((downloaded / segmentUrls.length) * 100)}%`, downloaded });
-    }
-
-    // concat + convert
-    const listFile = createConcatList(jobDir, segmentUrls.length);
-    const outputFile = path.join(jobDir, "output.mp4");
-    updateJob(jobId, { status: "converting" });
-
-    await convertToMp4(listFile, outputFile);
-
-    updateJob(jobId, { status: "done", progress: "100%", file: outputFile });
-  } catch (err) {
-    logError(`Job ${jobId} failed`, err);
-    updateJob(jobId, { status: "error", progress: "100%", error: err.message });
-  }
-}
-
-// ===================== START SERVER =====================
-app.listen(PORT, () => {
-  console.log(`HLS Converter server running on port ${PORT}`);
+  res.download(job.file, `video_${req.params.jobId}.mp4`);
 });
+
+// Test route
+app.get("/", (req, res) => {
+  res.json({ message: "HLS Converter server running" });
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
