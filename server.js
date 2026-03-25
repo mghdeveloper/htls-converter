@@ -1,110 +1,150 @@
-// server.js
 import express from "express";
-import { exec } from "child_process";
+import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
-import crypto from "crypto";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { spawn } from "child_process";
 
 const app = express();
 app.use(express.json());
 
-const TMP_DIR = path.join(__dirname, "tmp");
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
+const PORT = process.env.PORT || 3000;
+const jobs = {};
 
-const jobs = {}; // store job progress & status
+function log(id, msg) {
+  console.log(`[${id}] ${msg}`);
+}
 
-// ===== HELPER =====
-function generateJobId() {
-  return Date.now().toString() + Math.floor(Math.random() * 1000);
+// ===== DOWNLOAD SEGMENT =====
+async function download(url, file) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Failed segment");
+
+  const stream = fs.createWriteStream(file);
+  await new Promise((resolve, reject) => {
+    res.body.pipe(stream);
+    res.body.on("error", reject);
+    stream.on("finish", resolve);
+  });
 }
 
 // ===== PROCESS JOB =====
-function processJob(episode_id, jobId) {
-  const jobDir = path.join(TMP_DIR, jobId);
-  if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
+async function processJob(id, episode_id) {
+  try {
+    const dir = `./tmp/${id}`;
+    fs.mkdirSync(dir, { recursive: true });
 
-  const outputFile = path.join(jobDir, "video.mp4");
-  const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
+    const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
 
-  jobs[jobId] = {
-    status: "processing",
-    progress: 0,
-    total: 0,
-    downloaded: 0,
-    file: null,
-    m3u8: masterUrl,
-    error: null,
-  };
+    log(id, "fetch master");
+    const master = await (await fetch(masterUrl)).text();
 
-  // FFmpeg command using direct HLS URL
-  const ffmpegCmd = `ffmpeg -y -protocol_whitelist file,http,https,tcp,tls -i "${masterUrl}" -c copy "${outputFile}"`;
+    const quality = master.split("\n").find(l => l && !l.startsWith("#"));
+    const playlistUrl = new URL(quality, masterUrl).href;
 
-  const ffmpegProc = exec(ffmpegCmd, (err, stdout, stderr) => {
-    if (err) {
-      console.error("FFmpeg error:", stderr);
-      jobs[jobId].status = "error";
-      jobs[jobId].progress = "100%";
-      jobs[jobId].error = stderr;
-      return;
-    }
-    jobs[jobId].status = "done";
-    jobs[jobId].progress = "100%";
-    jobs[jobId].file = outputFile;
-  });
+    log(id, "fetch playlist");
+    const playlist = await (await fetch(playlistUrl)).text();
 
-  // Optional: parse ffmpeg stderr for progress (rough)
-  ffmpegProc.stderr.on("data", (data) => {
-    const lines = data.toString().split("\n");
-    lines.forEach((line) => {
-      if (line.includes("frame=")) {
-        // simple rough progress parsing
-        jobs[jobId].progress = "processing";
+    const lines = playlist.split("\n");
+
+    let segmentIndex = 0;
+    let newPlaylist = "";
+
+    const segments = [];
+
+    // ===== PARSE PLAYLIST =====
+    for (let line of lines) {
+      if (line.trim() && !line.startsWith("#")) {
+        const segUrl = line.startsWith("http")
+          ? line
+          : new URL(line, playlistUrl).href;
+
+        const local = `${segmentIndex}.ts`;
+        segments.push({ url: segUrl, file: `${dir}/${local}` });
+
+        newPlaylist += local + "\n";
+        segmentIndex++;
+      } else {
+        newPlaylist += line + "\n";
       }
+    }
+
+    jobs[id].total = segments.length;
+
+    // ===== DOWNLOAD ALL SEGMENTS =====
+    let done = 0;
+    for (let s of segments) {
+      await download(s.url, s.file);
+      done++;
+      jobs[id].downloaded = done;
+      jobs[id].progress = Math.floor((done / segments.length) * 100) + "%";
+    }
+
+    // ===== SAVE PLAYLIST =====
+    const localM3U8 = `${dir}/local.m3u8`;
+    fs.writeFileSync(localM3U8, newPlaylist);
+
+    // ===== FFMPEG =====
+    log(id, "ffmpeg start");
+
+    await new Promise((resolve, reject) => {
+      const ff = spawn("ffmpeg", [
+        "-y",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,http,https,tcp,tls",
+        "-i", localM3U8,
+        "-c", "copy",
+        `${dir}/output.mp4`
+      ]);
+
+      ff.stderr.on("data", d => console.log(d.toString()));
+
+      ff.on("close", code => {
+        code === 0 ? resolve() : reject(new Error("ffmpeg failed"));
+      });
     });
-  });
+
+    jobs[id].status = "done";
+    jobs[id].file = `${dir}/output.mp4`;
+    jobs[id].progress = "100%";
+
+  } catch (e) {
+    jobs[id].status = "error";
+    jobs[id].error = e.message;
+    console.log("ERROR:", e);
+  }
 }
 
 // ===== ROUTES =====
 
-// START JOB
+// KEEP SAME FOR PHP
 app.post("/convert", (req, res) => {
-  const episode_id = req.body.episode_id;
-  if (!episode_id) return res.json({ status: "error", error: "missing episode_id" });
+  const id = Date.now().toString();
+  const { episode_id } = req.body;
 
-  const jobId = generateJobId();
-  processJob(episode_id, jobId);
+  jobs[id] = {
+    status: "processing",
+    progress: "0%",
+    total: 0,
+    downloaded: 0,
+    file: null,
+    error: null
+  };
 
-  res.json({ status: "ok", job_id: jobId });
+  processJob(id, episode_id);
+
+  res.json({ id });
 });
 
-// CHECK PROGRESS
-app.get("/progress/:jobId", (req, res) => {
-  const jobId = req.params.jobId;
-  if (!jobs[jobId]) return res.json({ status: "error", error: "invalid job_id" });
-
-  res.json(jobs[jobId]);
+app.get("/progress/:id", (req, res) => {
+  res.json(jobs[req.params.id] || { error: "not found" });
 });
 
-// DOWNLOAD FILE
-app.get("/download/:jobId", (req, res) => {
-  const jobId = req.params.jobId;
-  if (!jobs[jobId]) return res.json({ status: "error", error: "invalid job_id" });
-
-  const job = jobs[jobId];
-  if (job.status !== "done" || !fs.existsSync(job.file)) {
-    return res.json({ status: "error", error: "file not ready" });
+app.get("/download/:id", (req, res) => {
+  const job = jobs[req.params.id];
+  if (!job || job.status !== "done") {
+    return res.json({ error: "not ready" });
   }
-
-  const filename = `video_${jobId}.mp4`;
-  res.download(job.file, filename, (err) => {
-    if (err) console.error("Download error:", err);
-  });
+  res.download(job.file);
 });
 
-// LISTEN
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`⚡ HLS Converter server running on port ${PORT}`));
+app.listen(PORT, () => console.log("Server running", PORT));
