@@ -1,6 +1,6 @@
 {
   "name": "htls-converter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "HLS (m3u8) to MP4 converter with queue and progress tracking",
   "main": "server.js",
   "type": "module",
@@ -21,5 +21,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
