@@ -8,27 +8,29 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ===== CONFIG =====
+const BASE_API = "https://kiroflix.cu.ma/generate/generate_episode.php";
+const BASE_FILES = "https://kiroflix.cu.ma/generate/";
+
 const JOB_DIR = "./jobs";
 const VIDEO_DIR = "./videos";
 const TEMP_DIR = "./temp";
-const MAX_CONCURRENT = 2;
-const SEGMENT_CONCURRENCY = 30;
 
-if (!fs.existsSync(JOB_DIR)) fs.mkdirSync(JOB_DIR);
-if (!fs.existsSync(VIDEO_DIR)) fs.mkdirSync(VIDEO_DIR);
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
+const MAX_CONCURRENT = 2;
+const SEGMENT_CONCURRENCY = 10;
+
+[JOB_DIR, VIDEO_DIR, TEMP_DIR].forEach(d => {
+    if (!fs.existsSync(d)) fs.mkdirSync(d);
+});
 
 let activeJobs = 0;
 const queue = [];
 
-// ===== HEADERS (IMPORTANT) =====
+// ===== HEADERS =====
 const HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://megacloud.blog/",
-    "Origin": "https://megacloud.blog"
+    "User-Agent": "Mozilla/5.0"
 };
 
-// ===== JOB SYSTEM =====
+// ===== JOB =====
 function createJob(data) {
     const id = Date.now().toString();
     const job = {
@@ -40,7 +42,6 @@ function createJob(data) {
         file: null,
         ...data
     };
-
     fs.writeFileSync(`${JOB_DIR}/${id}.json`, JSON.stringify(job));
     return job;
 }
@@ -59,13 +60,14 @@ function getJob(id) {
     return JSON.parse(fs.readFileSync(file));
 }
 
-// ===== FETCH SOURCE =====
-async function getSource(episodeId) {
-    const res = await fetch(`https://kiroflix.site/api/getsources-v2.php?episode_id=${episodeId}`);
+// ===== GET M3U8 FROM YOUR PHP =====
+async function getMaster(episodeId) {
+    const res = await fetch(`${BASE_API}?episode_id=${episodeId}`);
     const data = await res.json();
 
-    return data.primary?.sources?.[0]?.file ||
-           data.secondary?.sources?.[0]?.file;
+    if (!data.success) throw new Error("API failed");
+
+    return BASE_FILES + data.master.replace(/\\/g, "");
 }
 
 // ===== PARSE M3U8 =====
@@ -76,22 +78,19 @@ async function parseM3U8(url) {
     const lines = text.split("\n");
     const base = url.substring(0, url.lastIndexOf("/") + 1);
 
-    // detect variant playlist
+    // variant playlist
     const variant = lines.find(l => l && !l.startsWith("#") && l.includes(".m3u8"));
     if (variant) {
-        const newUrl = variant.startsWith("http") ? variant : base + variant;
-        return parseM3U8(newUrl);
+        const next = variant.startsWith("http") ? variant : base + variant;
+        return parseM3U8(next);
     }
 
-    // segments
-    const segments = lines
+    return lines
         .filter(l => l && !l.startsWith("#"))
         .map(l => l.startsWith("http") ? l : base + l);
-
-    return segments;
 }
 
-// ===== DOWNLOAD SEGMENTS =====
+// ===== DOWNLOAD =====
 async function downloadSegments(job, segments) {
     const dir = `${TEMP_DIR}/${job.id}`;
     fs.mkdirSync(dir, { recursive: true });
@@ -108,7 +107,7 @@ async function downloadSegments(job, segments) {
             for (let retry = 0; retry < 3; retry++) {
                 try {
                     const res = await fetch(url, { headers: HEADERS });
-                    const buffer = await res.buffer();
+                    const buffer = Buffer.from(await res.arrayBuffer());
 
                     fs.writeFileSync(`${dir}/${i}.ts`, buffer);
 
@@ -123,31 +122,31 @@ async function downloadSegments(job, segments) {
         }
     }
 
-    const workers = Array.from({ length: SEGMENT_CONCURRENCY }, worker);
-    await Promise.all(workers);
+    await Promise.all(
+        Array.from({ length: SEGMENT_CONCURRENCY }, worker)
+    );
 
     return dir;
 }
 
-// ===== MERGE TS =====
-async function mergeTS(job, dir, count) {
-    const outputTS = `${dir}/output.ts`;
-    const write = fs.createWriteStream(outputTS);
+// ===== MERGE =====
+async function mergeTS(dir, count) {
+    const output = `${dir}/merged.ts`;
+    const write = fs.createWriteStream(output);
 
     for (let i = 0; i < count; i++) {
         const file = `${dir}/${i}.ts`;
         if (fs.existsSync(file)) {
-            const data = fs.readFileSync(file);
-            write.write(data);
+            write.write(fs.readFileSync(file));
         }
     }
 
     write.end();
-    return outputTS;
+    return output;
 }
 
-// ===== CONVERT TO MP4 =====
-function convertToMp4(input, output, jobId) {
+// ===== CONVERT =====
+function convertToMp4(input, output) {
     return new Promise((resolve, reject) => {
         const ffmpeg = spawn("ffmpeg", [
             "-i", input,
@@ -157,13 +156,12 @@ function convertToMp4(input, output, jobId) {
         ]);
 
         ffmpeg.on("close", code => {
-            if (code === 0) resolve();
-            else reject();
+            code === 0 ? resolve() : reject();
         });
     });
 }
 
-// ===== PROCESS JOB =====
+// ===== PROCESS =====
 async function processJob(job) {
     try {
         updateJob(job.id, { status: "processing" });
@@ -172,11 +170,11 @@ async function processJob(job) {
 
         const dir = await downloadSegments(job, segments);
 
-        const tsFile = await mergeTS(job, dir, segments.length);
+        const ts = await mergeTS(dir, segments.length);
 
         const output = `${VIDEO_DIR}/${job.id}.mp4`;
 
-        await convertToMp4(tsFile, output, job.id);
+        await convertToMp4(ts, output);
 
         updateJob(job.id, {
             status: "done",
@@ -184,7 +182,8 @@ async function processJob(job) {
             progress: 100
         });
 
-    } catch (err) {
+    } catch (e) {
+        console.error(e);
         updateJob(job.id, { status: "error" });
     }
 
@@ -202,14 +201,12 @@ function processQueue() {
 }
 
 // ===== ROUTES =====
-
-// start
 app.get("/start", async (req, res) => {
     const { episode_id } = req.query;
-    if (!episode_id) return res.json({ error: "missing episode_id" });
 
     try {
-        const m3u8 = await getSource(episode_id);
+        const m3u8 = await getMaster(episode_id);
+
         const job = createJob({ m3u8 });
 
         queue.push(job);
@@ -222,22 +219,20 @@ app.get("/start", async (req, res) => {
     }
 });
 
-// progress
 app.get("/progress/:id", (req, res) => {
     const job = getJob(req.params.id);
     if (!job) return res.sendStatus(404);
     res.json(job);
 });
 
-// download
 app.get("/download/:id", (req, res) => {
     const job = getJob(req.params.id);
-    if (!job || job.status !== "done") return res.json({ error: "not ready" });
-
+    if (!job || job.status !== "done") {
+        return res.json({ error: "not ready" });
+    }
     res.download(job.file);
 });
 
-// ===== START =====
 app.listen(PORT, () => {
     console.log("Server running on", PORT);
 });
