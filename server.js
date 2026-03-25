@@ -3,236 +3,168 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
+import crypto from "crypto";
 
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
+const JOBS_DIR = path.resolve("./jobs");
+if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR, { recursive: true });
 
-// ===== CONFIG =====
-const BASE_API = "https://kiroflix.cu.ma/generate/generate_episode.php";
-const BASE_FILES = "https://kiroflix.cu.ma/generate/";
-
-const JOB_DIR = "./jobs";
-const VIDEO_DIR = "./videos";
-const TEMP_DIR = "./temp";
-
-const MAX_CONCURRENT = 2;
-const SEGMENT_CONCURRENCY = 10;
-
-[JOB_DIR, VIDEO_DIR, TEMP_DIR].forEach(d => {
-    if (!fs.existsSync(d)) fs.mkdirSync(d);
-});
-
-let activeJobs = 0;
-const queue = [];
-
-// ===== HEADERS =====
-const HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-};
-
-// ===== JOB =====
-function createJob(data) {
-    const id = Date.now().toString();
-    const job = {
-        id,
-        status: "queued",
-        progress: 0,
-        total: 0,
-        downloaded: 0,
-        file: null,
-        ...data
-    };
-    fs.writeFileSync(`${JOB_DIR}/${id}.json`, JSON.stringify(job));
-    return job;
+// ===================== HELPERS =====================
+function logError(msg, err = null) {
+  const logLine = `[${new Date().toISOString()}] ${msg} ${
+    err ? JSON.stringify(err) : ""
+  }\n`;
+  console.error(logLine);
+  fs.appendFileSync(path.join(JOBS_DIR, "errors.log"), logLine);
 }
 
-function updateJob(id, updates) {
-    const file = `${JOB_DIR}/${id}.json`;
-    if (!fs.existsSync(file)) return;
-    const job = JSON.parse(fs.readFileSync(file));
-    Object.assign(job, updates);
-    fs.writeFileSync(file, JSON.stringify(job));
+function sanitizeFileName(name) {
+  return name.replace(/[^a-z0-9_\-\.]/gi, "_");
 }
 
-function getJob(id) {
-    const file = `${JOB_DIR}/${id}.json`;
-    if (!fs.existsSync(file)) return null;
-    return JSON.parse(fs.readFileSync(file));
+function encryptUrl(url) {
+  const ENC_KEY = "CHANGE_THIS_TO_RANDOM_32_CHAR_SECRET_KEY_123456";
+  const ENC_METHOD = "aes-256-cbc";
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ENC_METHOD, ENC_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(url), cipher.final()]);
+  return Buffer.concat([iv, encrypted]).toString("base64");
 }
 
-// ===== GET M3U8 FROM YOUR PHP =====
-async function getMaster(episodeId) {
-    const res = await fetch(`${BASE_API}?episode_id=${episodeId}`);
-    const data = await res.json();
-
-    if (!data.success) throw new Error("API failed");
-
-    return BASE_FILES + data.master.replace(/\\/g, "");
-}
-
-// ===== PARSE M3U8 =====
-async function parseM3U8(url) {
-    const res = await fetch(url, { headers: HEADERS });
-    const text = await res.text();
-
-    const lines = text.split("\n");
-    const base = url.substring(0, url.lastIndexOf("/") + 1);
-
-    // variant playlist
-    const variant = lines.find(l => l && !l.startsWith("#") && l.includes(".m3u8"));
-    if (variant) {
-        const next = variant.startsWith("http") ? variant : base + variant;
-        return parseM3U8(next);
+async function downloadSegment(url, dest) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buffer = await res.arrayBuffer();
+      fs.writeFileSync(dest, Buffer.from(buffer));
+      return;
+    } catch (err) {
+      logError(`Segment download failed (${attempt}/3): ${url}`, err);
+      if (attempt === 3) throw err;
     }
-
-    return lines
-        .filter(l => l && !l.startsWith("#"))
-        .map(l => l.startsWith("http") ? l : base + l);
+  }
 }
 
-// ===== DOWNLOAD =====
-async function downloadSegments(job, segments) {
-    const dir = `${TEMP_DIR}/${job.id}`;
-    fs.mkdirSync(dir, { recursive: true });
-
-    updateJob(job.id, { total: segments.length });
-
-    let index = 0;
-
-    async function worker() {
-        while (index < segments.length) {
-            const i = index++;
-            const url = segments[i];
-
-            for (let retry = 0; retry < 3; retry++) {
-                try {
-                    const res = await fetch(url, { headers: HEADERS });
-                    const buffer = Buffer.from(await res.arrayBuffer());
-
-                    fs.writeFileSync(`${dir}/${i}.ts`, buffer);
-
-                    updateJob(job.id, {
-                        downloaded: i + 1,
-                        progress: Math.floor(((i + 1) / segments.length) * 100)
-                    });
-
-                    break;
-                } catch {}
-            }
-        }
-    }
-
-    await Promise.all(
-        Array.from({ length: SEGMENT_CONCURRENCY }, worker)
-    );
-
-    return dir;
+function createConcatList(dir, total) {
+  const listFile = path.join(dir, "list.txt");
+  const content = Array.from({ length: total })
+    .map((_, i) => `file '${path.join(dir, `${i}.ts`)}'`)
+    .join("\n");
+  fs.writeFileSync(listFile, content);
+  return listFile;
 }
 
-// ===== MERGE =====
-async function mergeTS(dir, count) {
-    const output = `${dir}/merged.ts`;
-    const write = fs.createWriteStream(output);
+function convertToMp4(listFile, output) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", [
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      listFile,
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      output,
+    ]);
 
-    for (let i = 0; i < count; i++) {
-        const file = `${dir}/${i}.ts`;
-        if (fs.existsSync(file)) {
-            write.write(fs.readFileSync(file));
-        }
-    }
+    ffmpeg.stderr.on("data", (d) => console.log(d.toString()));
 
-    write.end();
-    return output;
-}
-
-// ===== CONVERT =====
-function convertToMp4(input, output) {
-    return new Promise((resolve, reject) => {
-        const ffmpeg = spawn("ffmpeg", [
-            "-i", input,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            output
-        ]);
-
-        ffmpeg.on("close", code => {
-            code === 0 ? resolve() : reject();
-        });
+    ffmpeg.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("FFmpeg failed with code " + code));
     });
+  });
 }
 
-// ===== PROCESS =====
-async function processJob(job) {
-    try {
-        updateJob(job.id, { status: "processing" });
+// ===================== JOB MANAGEMENT =====================
+const jobs = {};
 
-        const segments = await parseM3U8(job.m3u8);
-
-        const dir = await downloadSegments(job, segments);
-
-        const ts = await mergeTS(dir, segments.length);
-
-        const output = `${VIDEO_DIR}/${job.id}.mp4`;
-
-        await convertToMp4(ts, output);
-
-        updateJob(job.id, {
-            status: "done",
-            file: output,
-            progress: 100
-        });
-
-    } catch (e) {
-        console.error(e);
-        updateJob(job.id, { status: "error" });
-    }
-
-    activeJobs--;
-    processQueue();
+function updateJob(id, data) {
+  if (!jobs[id]) jobs[id] = {};
+  Object.assign(jobs[id], data);
 }
 
-// ===== QUEUE =====
-function processQueue() {
-    if (activeJobs >= MAX_CONCURRENT || queue.length === 0) return;
+// ===================== ROUTES =====================
 
-    const job = queue.shift();
-    activeJobs++;
-    processJob(job);
-}
+// 1️⃣ Submit job
+app.post("/convert", async (req, res) => {
+  try {
+    const { episode_id } = req.body;
+    if (!episode_id) return res.status(400).json({ error: "Missing episode_id" });
 
-// ===== ROUTES =====
-app.get("/start", async (req, res) => {
-    const { episode_id } = req.query;
+    const jobId = Date.now().toString();
+    const jobDir = path.join(JOBS_DIR, sanitizeFileName(jobId));
+    if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir, { recursive: true });
 
-    try {
-        const m3u8 = await getMaster(episode_id);
+    const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
 
-        const job = createJob({ m3u8 });
+    updateJob(jobId, { id: jobId, status: "queued", progress: "0%", total: 0, downloaded: 0, file: null, m3u8: masterUrl });
 
-        queue.push(job);
-        processQueue();
+    res.json({ id: jobId });
 
-        res.json({ job_id: job.id });
-
-    } catch {
-        res.json({ error: "failed" });
-    }
+    // start processing asynchronously
+    processJob(jobId, masterUrl, jobDir);
+  } catch (err) {
+    logError("Convert endpoint error", err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
+// 2️⃣ Job progress
 app.get("/progress/:id", (req, res) => {
-    const job = getJob(req.params.id);
-    if (!job) return res.sendStatus(404);
-    res.json(job);
+  const job = jobs[req.params.id];
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
 });
 
-app.get("/download/:id", (req, res) => {
-    const job = getJob(req.params.id);
-    if (!job || job.status !== "done") {
-        return res.json({ error: "not ready" });
+// ===================== JOB PROCESSING =====================
+async function processJob(jobId, masterUrl, jobDir) {
+  try {
+    updateJob(jobId, { status: "downloading" });
+
+    const masterRes = await fetch(masterUrl);
+    if (!masterRes.ok) throw new Error("Master.m3u8 fetch failed");
+    const masterText = await masterRes.text();
+    const lines = masterText.split("\n").filter((l) => !l.startsWith("#EXT-X-I-FRAME"));
+
+    // extract segments
+    const segmentUrls = lines.filter((l) => l && !l.startsWith("#"));
+    updateJob(jobId, { total: segmentUrls.length });
+
+    // download segments
+    let downloaded = 0;
+    for (let i = 0; i < segmentUrls.length; i++) {
+      const url = segmentUrls[i].startsWith("http")
+        ? segmentUrls[i]
+        : new URL(segmentUrls[i], masterUrl).href;
+      const dest = path.join(jobDir, `${i}.ts`);
+      await downloadSegment(url, dest);
+      downloaded++;
+      updateJob(jobId, { progress: `${Math.floor((downloaded / segmentUrls.length) * 100)}%`, downloaded });
     }
-    res.download(job.file);
-});
 
+    // concat + convert
+    const listFile = createConcatList(jobDir, segmentUrls.length);
+    const outputFile = path.join(jobDir, "output.mp4");
+    updateJob(jobId, { status: "converting" });
+
+    await convertToMp4(listFile, outputFile);
+
+    updateJob(jobId, { status: "done", progress: "100%", file: outputFile });
+  } catch (err) {
+    logError(`Job ${jobId} failed`, err);
+    updateJob(jobId, { status: "error", progress: "100%", error: err.message });
+  }
+}
+
+// ===================== START SERVER =====================
 app.listen(PORT, () => {
-    console.log("Server running on", PORT);
+  console.log(`HLS Converter server running on port ${PORT}`);
 });
