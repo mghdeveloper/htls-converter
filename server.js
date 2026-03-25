@@ -4,13 +4,12 @@ import fs from "fs";
 import path from "path";
 import { exec } from "child_process";
 import { fileURLToPath } from "url";
-import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "500mb" })); // allow large POST payloads
 
 const PORT = process.env.PORT || 3000;
 
@@ -40,19 +39,20 @@ async function downloadFile(url, dest) {
 }
 
 // ===== JOB WORKER =====
-async function processJob(jobId, m3u8Url) {
+async function processJob(jobId, episode_id) {
   const job = jobs[jobId];
   try {
     job.status = "downloading";
 
+    // Generate master m3u8 from episode_id (like your PHP call)
+    const m3u8Url = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
+
     const tmpDir = path.join(__dirname, "tmp", jobId);
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // Fetch master playlist
     const masterContent = await fetchText(m3u8Url);
     const lines = masterContent.split("\n");
 
-    // Extract .ts segment URLs
     const segments = lines.filter(l => l.trim() && !l.startsWith("#"));
     job.total = segments.length;
     job.downloaded = 0;
@@ -73,7 +73,7 @@ async function processJob(jobId, m3u8Url) {
       job.progress = `${Math.floor(((i + 1) / segments.length) * 100)}%`;
     }
 
-    // Save local playlist
+    // Local playlist
     const localM3u8 = path.join(tmpDir, "local.m3u8");
     const m3u8Data = [
       "#EXTM3U",
@@ -85,7 +85,7 @@ async function processJob(jobId, m3u8Url) {
     ].join("\n");
     fs.writeFileSync(localM3u8, m3u8Data);
 
-    // Run FFmpeg to convert to MP4
+    // Convert to MP4
     const outputFile = path.join(tmpDir, "video.mp4");
     await new Promise((resolve, reject) => {
       exec(
@@ -101,7 +101,7 @@ async function processJob(jobId, m3u8Url) {
     job.file = outputFile;
     job.progress = "100%";
   } catch (err) {
-    console.error("Job error:", err);
+    console.error(`Job ${jobId} error:`, err);
     job.status = "error";
     job.error = err.message;
   }
@@ -109,10 +109,10 @@ async function processJob(jobId, m3u8Url) {
 
 // ===== ROUTES =====
 
-// Start job
-app.get("/start", async (req, res) => {
-  const { episode_id, m3u8 } = req.query;
-  if (!episode_id || !m3u8) return res.json({ error: "Missing episode_id or m3u8" });
+// POST /convert (from PHP start)
+app.post("/convert", (req, res) => {
+  const episode_id = req.body.episode_id;
+  if (!episode_id) return res.json({ error: "missing episode_id" });
 
   const jobId = generateJobId();
   jobs[jobId] = {
@@ -124,20 +124,19 @@ app.get("/start", async (req, res) => {
     error: null
   };
 
-  // Start worker asynchronously
-  processJob(jobId, m3u8);
+  processJob(jobId, episode_id);
 
   res.json({ id: jobId, status: "queued" });
 });
 
-// Progress
+// GET /progress/:jobId
 app.get("/progress/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.json({ error: "Invalid jobId" });
   res.json(job);
 });
 
-// Download
+// GET /download/:jobId
 app.get("/download/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.json({ error: "Invalid jobId" });
@@ -146,7 +145,7 @@ app.get("/download/:jobId", (req, res) => {
   res.download(job.file, `video_${req.params.jobId}.mp4`);
 });
 
-// Test route
+// Default
 app.get("/", (req, res) => {
   res.json({ message: "HLS Converter server running" });
 });
