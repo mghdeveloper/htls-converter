@@ -1,7 +1,6 @@
 import express from "express";
 import fetch from "node-fetch";
 import fs from "fs";
-import path from "path";
 import { spawn } from "child_process";
 
 const app = express();
@@ -14,171 +13,181 @@ function log(id, msg) {
   console.log(`[${id}] ${msg}`);
 }
 
-// ===== DOWNLOAD SEGMENT =====
-async function download(url, file, id, index) {
-  try {
-    log(id, `⬇️ Segment ${index} start`);
-
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
-    const stream = fs.createWriteStream(file);
-
-    await new Promise((resolve, reject) => {
-      res.body.pipe(stream);
-
-      res.body.on("error", (err) => {
-        log(id, `❌ Stream error seg ${index}`);
-        reject(err);
-      });
-
-      stream.on("finish", () => {
-        log(id, `✅ Segment ${index} done`);
-        resolve();
-      });
-    });
-
-  } catch (err) {
-    log(id, `❌ Segment ${index} failed: ${err.message}`);
-    throw err;
-  }
+function formatSize(bytes) {
+  if (!bytes) return null;
+  const gb = bytes / (1024 ** 3);
+  if (gb >= 1) return gb.toFixed(2) + " GB";
+  return (bytes / (1024 ** 2)).toFixed(2) + " MB";
 }
 
-// ===== PROCESS JOB =====
-async function processJob(id, episode_id) {
+// ===== DOWNLOAD SEGMENT =====
+async function download(url, file) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Segment failed");
+
+  const stream = fs.createWriteStream(file);
+
+  await new Promise((resolve, reject) => {
+    res.body.pipe(stream);
+    res.body.on("error", reject);
+    stream.on("finish", resolve);
+  });
+}
+
+// ===== PROCESS =====
+async function processJob(id, episode_id, quality, subtitle, subtitle_mode) {
   try {
     const dir = `./tmp/${id}`;
     fs.mkdirSync(dir, { recursive: true });
 
     const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
 
-    log(id, "📥 Fetch master.m3u8");
+    log(id, "Fetch master");
     const master = await (await fetch(masterUrl)).text();
 
-    const quality = master.split("\n").find(l => l && !l.startsWith("#"));
-    const playlistUrl = new URL(quality, masterUrl).href;
+    const playlists = master.split("\n").filter(l => l && !l.startsWith("#"));
 
-    log(id, "📥 Fetch playlist");
+    let selected;
+    if (quality === "low") selected = playlists.at(-1);
+    else if (quality === "medium") selected = playlists[Math.floor(playlists.length / 2)];
+    else selected = playlists[0];
+
+    const playlistUrl = new URL(selected, masterUrl).href;
+
+    log(id, "Fetch playlist");
     const playlist = await (await fetch(playlistUrl)).text();
 
     const lines = playlist.split("\n");
 
-    let segmentIndex = 0;
     let newPlaylist = "";
-    const segments = [];
+    let segments = [];
+    let i = 0;
 
     for (let line of lines) {
       if (line.trim() && !line.startsWith("#")) {
+        const url = line.startsWith("http") ? line : new URL(line, playlistUrl).href;
 
-        const segUrl = line.startsWith("http")
-          ? line
-          : new URL(line, playlistUrl).href;
-
-        const local = `${segmentIndex}.ts`;
-
-        segments.push({
-          url: segUrl,
-          file: `${dir}/${local}`,
-          index: segmentIndex
-        });
-
-        newPlaylist += local + "\n";
-        segmentIndex++;
-
+        segments.push({ url, file: `${dir}/${i}.ts` });
+        newPlaylist += `${i}.ts\n`;
+        i++;
       } else {
         newPlaylist += line + "\n";
       }
     }
 
     jobs[id].total = segments.length;
-    log(id, `🎬 Total segments: ${segments.length}`);
 
-    // ===== DOWNLOAD SEGMENTS =====
     let done = 0;
     for (let s of segments) {
-      await download(s.url, s.file, id, s.index);
-
+      await download(s.url, s.file);
       done++;
       jobs[id].downloaded = done;
       jobs[id].progress = Math.floor((done / segments.length) * 100) + "%";
-
-      log(id, `📊 Progress: ${jobs[id].progress}`);
     }
 
-    // ===== SAVE PLAYLIST =====
     const localM3U8 = `${dir}/local.m3u8`;
     fs.writeFileSync(localM3U8, newPlaylist);
 
-    log(id, "🎥 Start FFmpeg");
+    // ===== SUBTITLE =====
+    let subtitleFile = null;
+
+    if (subtitle) {
+      try {
+        const vttUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/english.vtt`;
+        const vtt = await (await fetch(vttUrl)).text();
+
+        subtitleFile = `${dir}/sub.vtt`;
+        fs.writeFileSync(subtitleFile, vtt);
+
+        log(id, "Subtitle downloaded");
+      } catch {
+        log(id, "No subtitle found");
+      }
+    }
 
     // ===== FFMPEG =====
-    await new Promise((resolve, reject) => {
-      const ff = spawn("ffmpeg", [
-        "-y",
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls",
-        "-i", localM3U8,
-        "-c", "copy",
-        `${dir}/output.mp4`
-      ]);
+    const output = `${dir}/output.mp4`;
 
-      ff.stderr.on("data", d => {
-        const msg = d.toString();
-        console.log(`[${id}] FFmpeg:`, msg);
-      });
+    let ffArgs = [
+      "-y",
+      "-allowed_extensions", "ALL",
+      "-protocol_whitelist", "file,http,https,tcp,tls",
+      "-i", localM3U8
+    ];
+
+    if (subtitleFile && subtitle_mode === "hard") {
+      ffArgs.push(
+        "-vf", `subtitles=${subtitleFile}`,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-c:a", "copy"
+      );
+    } else if (subtitleFile && subtitle_mode === "soft") {
+      ffArgs.push(
+        "-i", subtitleFile,
+        "-c", "copy",
+        "-c:s", "mov_text"
+      );
+    } else {
+      ffArgs.push("-c", "copy");
+    }
+
+    ffArgs.push(output);
+
+    await new Promise((resolve, reject) => {
+      const ff = spawn("ffmpeg", ffArgs);
+
+      ff.stderr.on("data", d => console.log(`[${id}] ${d}`));
 
       ff.on("close", code => {
-        if (code === 0) {
-          log(id, "✅ FFmpeg done");
-          resolve();
-        } else {
-          log(id, `❌ FFmpeg failed code ${code}`);
-          reject(new Error("FFmpeg failed"));
-        }
+        code === 0 ? resolve() : reject(new Error("ffmpeg failed"));
       });
     });
 
+    const size = fs.statSync(output).size;
+
     jobs[id].status = "done";
-    jobs[id].file = `${dir}/output.mp4`;
+    jobs[id].file = output;
+    jobs[id].size = formatSize(size);
     jobs[id].progress = "100%";
 
   } catch (e) {
-    log(id, `🔥 ERROR: ${e.message}`);
+    log(id, "ERROR: " + e.message);
     jobs[id].status = "error";
     jobs[id].error = e.message;
   }
 }
 
 // ===== ROUTES =====
-
-// START (PHP compatible)
 app.post("/convert", (req, res) => {
   const id = Date.now().toString();
-  const { episode_id } = req.body;
+
+  const {
+    episode_id,
+    quality = "high",
+    subtitle = false,
+    subtitle_mode = "hard"
+  } = req.body;
 
   jobs[id] = {
     status: "processing",
     progress: "0%",
     total: 0,
     downloaded: 0,
+    size: null,
     file: null,
     error: null
   };
 
-  processJob(id, episode_id);
+  processJob(id, episode_id, quality, subtitle, subtitle_mode);
 
   res.json({ id });
 });
 
-// PROGRESS
 app.get("/progress/:id", (req, res) => {
   res.json(jobs[req.params.id] || { error: "not found" });
 });
 
-// DOWNLOAD (IMPORTANT FIX)
 app.get("/download/:id", (req, res) => {
   const job = jobs[req.params.id];
 
@@ -186,42 +195,15 @@ app.get("/download/:id", (req, res) => {
     return res.json({ error: "not ready" });
   }
 
-  const filePath = job.file;
-
-  if (!fs.existsSync(filePath)) {
-    return res.json({ error: "file missing" });
-  }
-
-  const stat = fs.statSync(filePath);
-
-  log(req.params.id, `📤 Start download (${stat.size} bytes)`);
+  const stat = fs.statSync(job.file);
 
   res.writeHead(200, {
     "Content-Type": "video/mp4",
     "Content-Disposition": `attachment; filename="video_${req.params.id}.mp4"`,
-    "Content-Length": stat.size,
-    "Cache-Control": "no-cache"
+    "Content-Length": stat.size
   });
 
-  const stream = fs.createReadStream(filePath);
-
-  stream.pipe(res);
-
-  // ===== CONNECTION LOGS =====
-  res.on("close", () => {
-    log(req.params.id, "⚠️ Client closed connection");
-  });
-
-  res.on("finish", () => {
-    log(req.params.id, "✅ Download finished");
-  });
-
-  stream.on("error", (err) => {
-    log(req.params.id, "❌ Stream error: " + err.message);
-  });
+  fs.createReadStream(job.file).pipe(res);
 });
 
-// ===== START SERVER =====
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("🚀 Running on", PORT));
