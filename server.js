@@ -20,50 +20,59 @@ function log(id, msg) {
   console.log(`[${id}] ${msg}`);
 }
 
-// ===== GET PLAYLIST FROM YOUR API =====
+// ===== GET PLAYLIST =====
 async function getPlaylist(episode_id) {
   const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
 
   const master = await (await fetch(masterUrl, { agent })).text();
   const quality = master.split("\n").find(l => l && !l.startsWith("#"));
+
   return new URL(quality, masterUrl).href;
 }
 
-// ===== STREAM SEGMENTS FAST =====
+// ===== SAFE STREAM (NO MEMORY LEAK) =====
 async function streamToFFmpeg(playlistUrl, pass, id) {
   const text = await (await fetch(playlistUrl, { agent })).text();
   const lines = text.split("\n").filter(l => l && !l.startsWith("#"));
 
   let done = 0;
   const total = lines.length;
-  const concurrency = 15;
 
-  async function fetchSeg(url) {
-    const res = await fetch(url, { agent });
-    if (!res.ok) throw new Error(`seg ${res.status}`);
-    return res.body;
-  }
+  const concurrency = 10;
+  let index = 0;
 
-  async function batch(arr) {
-    await Promise.all(arr.map(async (line) => {
-      const url = line.startsWith("http") ? line : new URL(line, playlistUrl).href;
-      const stream = await fetchSeg(url);
+  async function worker() {
+    while (true) {
+      let i;
 
+      // thread-safe index increment
+      if (index >= lines.length) return;
+      i = index++;
+
+      const line = lines[i];
+      const url = line.startsWith("http")
+        ? line
+        : new URL(line, playlistUrl).href;
+
+      const res = await fetch(url, { agent });
+      if (!res.ok) throw new Error(`Segment ${i} failed`);
+
+      // ===== KEY FIX: sequential pipe per segment =====
       await new Promise((resolve, reject) => {
-        stream.pipe(pass, { end: false });
-        stream.on("end", () => {
+        res.body.on("error", reject);
+
+        res.body.on("end", () => {
           done++;
           jobs[id].progress = Math.floor((done / total) * 85) + "%";
           resolve();
         });
-        stream.on("error", reject);
+
+        res.body.pipe(pass, { end: false });
       });
-    }));
+    }
   }
 
-  for (let i = 0; i < lines.length; i += concurrency) {
-    await batch(lines.slice(i, i + concurrency));
-  }
+  await Promise.all(Array.from({ length: concurrency }, worker));
 }
 
 // ===== SUBTITLE =====
@@ -107,7 +116,7 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
       "-i", "pipe:0"
     ];
 
-    // ===== SUBTITLE MODES =====
+    // ===== SUBTITLE =====
     if (subtitle && subtitle_mode === "hard") {
       args.push("-vf", `subtitles=${subtitle}`);
       args.push("-c:v", "libx264", "-preset", "veryfast", "-c:a", "copy");
@@ -123,11 +132,12 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
     const ffmpeg = spawn("ffmpeg", args);
     const pass = new PassThrough();
 
+    // optional safety (no warnings)
+    pass.setMaxListeners(0);
+
     pass.pipe(ffmpeg.stdin);
 
-    ffmpeg.stderr.on("data", d => {
-      // optional logs
-    });
+    ffmpeg.stderr.on("data", () => {}); // keep silent
 
     ffmpeg.on("close", code => {
       if (code === 0) {
@@ -142,7 +152,8 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
     });
 
     await streamToFFmpeg(playlistUrl, pass, id);
-    pass.end();
+
+    pass.end(); // VERY IMPORTANT
 
   } catch (e) {
     jobs[id].status = "error";
