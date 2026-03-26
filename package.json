@@ -1,7 +1,7 @@
 {
   "name": "htls-converter",
-  "version": "1.0.1",
-  "description": "HLS (m3u8) to MP4 converter with queue and progress tracking",
+  "version": "1.0.2",
+  "description": "HLS (m3u8) to MP4 converter with queue, subtitles, and progress tracking",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -14,13 +14,17 @@
     "ffmpeg",
     "video",
     "converter",
-    "stream"
+    "stream",
+    "subtitle"
   ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "m3u8stream": "^0.8.0",
+    "uuid": "^9.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
