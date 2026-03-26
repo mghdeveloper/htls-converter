@@ -3,6 +3,7 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
+import os from "os";
 
 const app = express();
 app.use(express.json());
@@ -14,7 +15,7 @@ function log(id, msg) {
   console.log(`[${id}] ${msg}`);
 }
 
-// ===== DOWNLOAD FILE (SEGMENTS + SUBS) =====
+// ===== DOWNLOAD FILE (STREAM TO DISK) =====
 async function download(url, file, id, index = "") {
   try {
     log(id, `⬇️ Download ${index} start`);
@@ -26,7 +27,6 @@ async function download(url, file, id, index = "") {
 
     await new Promise((resolve, reject) => {
       res.body.pipe(stream);
-
       res.body.on("error", reject);
       stream.on("finish", resolve);
       stream.on("error", reject);
@@ -37,6 +37,44 @@ async function download(url, file, id, index = "") {
     log(id, `❌ Download ${index} failed: ${err.message}`);
     throw err;
   }
+}
+
+// ===== MEMORY-BASED CONCURRENCY =====
+function getSafeConcurrency(max = 50) {
+  const freeMB = os.freemem() / 1024 / 1024;
+  if (freeMB < 150) return 3;
+  if (freeMB < 300) return 10;
+  if (freeMB < 700) return 25;
+  return max;
+}
+
+// ===== PARALLEL SEGMENT DOWNLOADER =====
+async function downloadSegmentsParallel(segments, id) {
+  const concurrency = getSafeConcurrency(50);
+  let active = 0;
+  let index = 0;
+
+  return new Promise((resolve, reject) => {
+    const next = () => {
+      if (index >= segments.length && active === 0) return resolve();
+
+      while (active < concurrency && index < segments.length) {
+        const s = segments[index++];
+        active++;
+
+        download(s.url, s.file, id, s.index)
+          .then(() => {
+            active--;
+            jobs[id].downloaded++;
+            jobs[id].progress = Math.floor((jobs[id].downloaded / segments.length) * 100) + "%";
+            next();
+          })
+          .catch(err => reject(err));
+      }
+    };
+
+    next();
+  });
 }
 
 // ===== PROCESS JOB =====
@@ -88,18 +126,10 @@ async function processJob(id, episode_id) {
     jobs[id].total = segments.length;
     log(id, `🎬 Total segments: ${segments.length}`);
 
-    // ===== DOWNLOAD SEGMENTS (SEQUENTIAL SAFE) =====
-    let done = 0;
-
-    for (let s of segments) {
-      await download(s.url, s.file, id, s.index);
-
-      done++;
-      jobs[id].downloaded = done;
-      jobs[id].progress = Math.floor((done / segments.length) * 100) + "%";
-
-      log(id, `📊 Progress: ${jobs[id].progress}`);
-    }
+    // ===== DOWNLOAD SEGMENTS (PARALLEL) =====
+    jobs[id].downloaded = 0;
+    jobs[id].progress = "0%";
+    await downloadSegmentsParallel(segments, id);
 
     // ===== SAVE LOCAL PLAYLIST =====
     const localM3U8 = `${dir}/local.m3u8`;
@@ -218,11 +248,9 @@ app.get("/download/:id", (req, res) => {
 
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
-
   const range = req.headers.range;
 
   if (range) {
-    // ===== RANGE REQUEST =====
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
@@ -245,13 +273,9 @@ app.get("/download/:id", (req, res) => {
     });
 
     stream.pipe(res);
-
-    stream.on("error", err => {
-      log(req.params.id, "❌ Stream error: " + err.message);
-    });
+    stream.on("error", err => log(req.params.id, "❌ Stream error: " + err.message));
 
   } else {
-    // ===== FULL FILE =====
     res.writeHead(200, {
       "Content-Length": fileSize,
       "Content-Type": "video/mp4",
