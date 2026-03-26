@@ -42,7 +42,7 @@ async function streamSegmentsToFFmpeg(playlistUrl, ffmpegStdin, id) {
         segmentStream.pipe(ffmpegStdin, { end: false });
         segmentStream.on("end", () => {
           completed++;
-          jobs[id].progress = Math.floor((completed / lines.length) * 80) + "%"; // first 80% is download
+          jobs[id].progress = Math.floor((completed / lines.length) * 80) + "%";
           log(id, `📊 Progress: ${jobs[id].progress}`);
           resolve();
         });
@@ -94,8 +94,7 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
     const outputFile = path.join(dir, "output.mp4");
     const ffmpegArgs = [
       "-y",
-      "-allowed_extensions", "ALL",
-      "-protocol_whitelist", "file,http,https,tcp,tls",
+      "-protocol_whitelist", "pipe,file,http,https,tcp,tls",
       "-i", "pipe:0"
     ];
 
@@ -115,8 +114,6 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
 
     const ffmpeg = spawn("ffmpeg", ffmpegArgs);
     const pass = new PassThrough();
-
-    // PIPE STREAM TO FFMPEG STDIN
     pass.pipe(ffmpeg.stdin);
 
     ffmpeg.stderr.on("data", d => console.log(`[${id}] FFmpeg: ${d.toString()}`));
@@ -136,7 +133,7 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
 
     // ===== START STREAMING SEGMENTS =====
     await streamSegmentsToFFmpeg(playlistUrl, pass, id);
-    pass.end(); // signal ffmpeg that input is finished
+    pass.end();
 
   } catch (err) {
     jobs[id].status = "error";
