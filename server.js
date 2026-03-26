@@ -3,194 +3,248 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
-import { PassThrough } from "stream";
-import https from "https";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const JOBS_DIR = path.resolve("./jobs");
-if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR);
-
 const jobs = {};
-const agent = new https.Agent({ rejectUnauthorized: false });
 
 function log(id, msg) {
   console.log(`[${id}] ${msg}`);
 }
 
-// ===== GET PLAYLIST =====
-async function getPlaylist(episode_id) {
-  const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
-
-  const master = await (await fetch(masterUrl, { agent })).text();
-  const quality = master.split("\n").find(l => l && !l.startsWith("#"));
-
-  return new URL(quality, masterUrl).href;
-}
-
-// ===== SAFE STREAM (NO MEMORY LEAK) =====
-async function streamToFFmpeg(playlistUrl, pass, id) {
-  const text = await (await fetch(playlistUrl, { agent })).text();
-  const lines = text.split("\n").filter(l => l && !l.startsWith("#"));
-
-  let done = 0;
-  const total = lines.length;
-
-  const concurrency = 10;
-  let index = 0;
-
-  async function worker() {
-    while (true) {
-      let i;
-
-      // thread-safe index increment
-      if (index >= lines.length) return;
-      i = index++;
-
-      const line = lines[i];
-      const url = line.startsWith("http")
-        ? line
-        : new URL(line, playlistUrl).href;
-
-      const res = await fetch(url, { agent });
-      if (!res.ok) throw new Error(`Segment ${i} failed`);
-
-      // ===== KEY FIX: sequential pipe per segment =====
-      await new Promise((resolve, reject) => {
-        res.body.on("error", reject);
-
-        res.body.on("end", () => {
-          done++;
-          jobs[id].progress = Math.floor((done / total) * 85) + "%";
-          resolve();
-        });
-
-        res.body.pipe(pass, { end: false });
-      });
-    }
-  }
-
-  await Promise.all(Array.from({ length: concurrency }, worker));
-}
-
-// ===== SUBTITLE =====
-async function getSubtitle(episode_id, dir) {
+// ===== DOWNLOAD FILE (SEGMENTS + SUBS) =====
+async function download(url, file, id, index = "") {
   try {
-    const url = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/english.vtt`;
-    const res = await fetch(url, { agent });
-    if (!res.ok) return null;
+    log(id, `⬇️ Download ${index} start`);
 
-    const file = path.join(dir, "sub.vtt");
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
     const stream = fs.createWriteStream(file);
 
     await new Promise((resolve, reject) => {
       res.body.pipe(stream);
+
       res.body.on("error", reject);
       stream.on("finish", resolve);
+      stream.on("error", reject);
     });
 
-    return file;
-  } catch {
-    return null;
+    log(id, `✅ Download ${index} done`);
+  } catch (err) {
+    log(id, `❌ Download ${index} failed: ${err.message}`);
+    throw err;
   }
 }
 
-// ===== PROCESS =====
-async function processJob(id, episode_id, subtitle_mode = "hard") {
+// ===== PROCESS JOB =====
+async function processJob(id, episode_id) {
   try {
-    const dir = path.join(JOBS_DIR, id);
+    const dir = `./tmp/${id}`;
     fs.mkdirSync(dir, { recursive: true });
 
-    jobs[id] = { status: "processing", progress: "0%", file: null };
+    const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
 
-    const playlistUrl = await getPlaylist(episode_id);
-    const subtitle = await getSubtitle(episode_id, dir);
+    // ===== FETCH MASTER =====
+    log(id, "📥 Fetch master.m3u8");
+    const master = await (await fetch(masterUrl)).text();
 
-    const output = path.join(dir, "output.mp4");
+    const quality = master.split("\n").find(l => l && !l.startsWith("#"));
+    const playlistUrl = new URL(quality, masterUrl).href;
 
-    const args = [
-      "-y",
-      "-protocol_whitelist", "pipe,file,http,https,tcp,tls",
-      "-i", "pipe:0"
-    ];
+    // ===== FETCH PLAYLIST =====
+    log(id, "📥 Fetch playlist");
+    const playlist = await (await fetch(playlistUrl)).text();
 
-    // ===== SUBTITLE =====
-    if (subtitle && subtitle_mode === "hard") {
-      args.push("-vf", `subtitles=${subtitle}`);
-      args.push("-c:v", "libx264", "-preset", "veryfast", "-c:a", "copy");
-    } else if (subtitle && subtitle_mode === "soft") {
-      args.push("-i", subtitle, "-map", "0", "-map", "1");
-      args.push("-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text");
-    } else {
-      args.push("-c", "copy");
+    const lines = playlist.split("\n");
+
+    let segmentIndex = 0;
+    let newPlaylist = "";
+    const segments = [];
+
+    for (let line of lines) {
+      if (line.trim() && !line.startsWith("#")) {
+        const segUrl = line.startsWith("http")
+          ? line
+          : new URL(line, playlistUrl).href;
+
+        const local = `${segmentIndex}.ts`;
+
+        segments.push({
+          url: segUrl,
+          file: `${dir}/${local}`,
+          index: segmentIndex
+        });
+
+        newPlaylist += local + "\n";
+        segmentIndex++;
+      } else {
+        newPlaylist += line + "\n";
+      }
     }
 
-    args.push(output);
+    jobs[id].total = segments.length;
+    log(id, `🎬 Total segments: ${segments.length}`);
 
-    const ffmpeg = spawn("ffmpeg", args);
-    const pass = new PassThrough();
+    // ===== DOWNLOAD SEGMENTS (SEQUENTIAL SAFE) =====
+    let done = 0;
 
-    // optional safety (no warnings)
-    pass.setMaxListeners(0);
+    for (let s of segments) {
+      await download(s.url, s.file, id, s.index);
 
-    pass.pipe(ffmpeg.stdin);
+      done++;
+      jobs[id].downloaded = done;
+      jobs[id].progress = Math.floor((done / segments.length) * 100) + "%";
 
-    ffmpeg.stderr.on("data", () => {}); // keep silent
+      log(id, `📊 Progress: ${jobs[id].progress}`);
+    }
 
-    ffmpeg.on("close", code => {
-      if (code === 0) {
-        jobs[id].status = "done";
-        jobs[id].file = output;
-        jobs[id].progress = "100%";
-        log(id, "✅ DONE");
+    // ===== SAVE LOCAL PLAYLIST =====
+    const localM3U8 = `${dir}/local.m3u8`;
+    fs.writeFileSync(localM3U8, newPlaylist);
+
+    // ===== DOWNLOAD SUBTITLE =====
+    const subtitleUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/english.vtt`;
+    const subtitlePath = `${dir}/sub.vtt`;
+
+    let hasSubtitle = true;
+
+    try {
+      log(id, "📥 Download subtitle");
+      await download(subtitleUrl, subtitlePath, id, "SUB");
+    } catch {
+      hasSubtitle = false;
+      log(id, "⚠️ Subtitle not available");
+    }
+
+    // ===== FFMPEG =====
+    log(id, "🎥 Start FFmpeg");
+
+    await new Promise((resolve, reject) => {
+      const args = [
+        "-y",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,http,https,tcp,tls",
+        "-i", localM3U8
+      ];
+
+      if (hasSubtitle && fs.existsSync(subtitlePath)) {
+        args.push("-i", subtitlePath);
+
+        args.push(
+          "-map", "0:v",
+          "-map", "0:a",
+          "-map", "1:0",
+          "-c", "copy",
+          "-c:s", "mov_text",
+          "-metadata:s:s:0", "language=eng",
+          "-disposition:s:0", "default"
+        );
       } else {
-        jobs[id].status = "error";
-        jobs[id].error = "ffmpeg failed";
+        args.push("-c", "copy");
       }
+
+      args.push(`${dir}/output.mp4`);
+
+      const ff = spawn("ffmpeg", args);
+
+      ff.stderr.on("data", d => {
+        console.log(`[${id}] FFmpeg: ${d.toString()}`);
+      });
+
+      ff.on("close", code => {
+        if (code === 0) {
+          log(id, "✅ FFmpeg done");
+          resolve();
+        } else {
+          log(id, `❌ FFmpeg failed (${code})`);
+          reject(new Error("FFmpeg failed"));
+        }
+      });
     });
 
-    await streamToFFmpeg(playlistUrl, pass, id);
-
-    pass.end(); // VERY IMPORTANT
+    // ===== DONE =====
+    jobs[id].status = "done";
+    jobs[id].file = `${dir}/output.mp4`;
+    jobs[id].progress = "100%";
 
   } catch (e) {
+    log(id, `🔥 ERROR: ${e.message}`);
     jobs[id].status = "error";
     jobs[id].error = e.message;
-    log(id, e.message);
   }
 }
 
 // ===== ROUTES =====
+
+// START
 app.post("/convert", (req, res) => {
-  const { episode_id, subtitle_mode } = req.body;
-
-  if (!episode_id) return res.json({ error: "missing episode_id" });
-
   const id = Date.now().toString();
-  processJob(id, episode_id, subtitle_mode);
+  const { episode_id } = req.body;
+
+  jobs[id] = {
+    status: "processing",
+    progress: "0%",
+    total: 0,
+    downloaded: 0,
+    file: null,
+    error: null
+  };
+
+  processJob(id, episode_id);
 
   res.json({ id });
 });
 
+// PROGRESS
 app.get("/progress/:id", (req, res) => {
   res.json(jobs[req.params.id] || { error: "not found" });
 });
 
+// DOWNLOAD
 app.get("/download/:id", (req, res) => {
   const job = jobs[req.params.id];
-  if (!job || job.status !== "done") return res.json({ error: "not ready" });
 
-  const stat = fs.statSync(job.file);
+  if (!job || job.status !== "done") {
+    return res.json({ error: "not ready" });
+  }
+
+  const filePath = job.file;
+
+  if (!fs.existsSync(filePath)) {
+    return res.json({ error: "file missing" });
+  }
+
+  const stat = fs.statSync(filePath);
+
+  log(req.params.id, `📤 Start download (${stat.size} bytes)`);
 
   res.writeHead(200, {
     "Content-Type": "video/mp4",
+    "Content-Disposition": `attachment; filename="video_${req.params.id}.mp4"`,
     "Content-Length": stat.size,
-    "Content-Disposition": `attachment; filename="video_${req.params.id}.mp4"`
+    "Cache-Control": "no-cache"
   });
 
-  fs.createReadStream(job.file).pipe(res);
+  const stream = fs.createReadStream(filePath);
+  stream.pipe(res);
+
+  res.on("close", () => {
+    log(req.params.id, "⚠️ Client closed connection");
+  });
+
+  res.on("finish", () => {
+    log(req.params.id, "✅ Download finished");
+  });
+
+  stream.on("error", err => {
+    log(req.params.id, "❌ Stream error: " + err.message);
+  });
 });
 
-app.listen(PORT, () => console.log("🚀 running", PORT));
+// ===== START SERVER =====
+app.listen(PORT, () => {
+  console.log("🚀 Server running on port", PORT);
+});
