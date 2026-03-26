@@ -1,132 +1,98 @@
 import express from "express";
+import m3u8stream from "m3u8stream";
+import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
 import path from "path";
-import ffmpeg from "fluent-ffmpeg";
-import m3u8stream from "m3u8stream";
 import { v4 as uuidv4 } from "uuid";
+import fetch from "node-fetch";
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-
 app.use(express.json());
 
-const TMP_DIR = "./tmp";
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
+const PORT = process.env.PORT || 3000;
+const JOBS_DIR = path.resolve("./jobs");
+if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR);
 
-const jobs = {};
+const jobs = {}; // { jobId: { progress, filepath, status } }
 
-// ===== HELPER =====
-function getOutputPath(jobId) {
-  const dir = path.join(TMP_DIR, jobId);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-  return path.join(dir, "output.mp4");
-}
-
-// ===== START CONVERT =====
+// ===== Start conversion =====
 app.post("/convert", async (req, res) => {
-  const { url, quality = "high", subtitle = false, subtitle_mode = "hard", subtitle_url } = req.body;
+  const { episode_id, quality = "high", subtitle = false, subtitle_mode = "hard" } = req.body;
 
-  if (!url) return res.status(400).json({ error: "missing url" });
+  if (!episode_id) return res.json({ error: "missing episode_id" });
 
   const jobId = uuidv4();
-  const output = getOutputPath(jobId);
+  const outFile = path.join(JOBS_DIR, `${jobId}.mp4`);
 
-  jobs[jobId] = { status: "processing", progress: 0, size: 0, file: output };
+  jobs[jobId] = { progress: 0, filepath: outFile, status: "processing" };
 
-  console.log(`[${jobId}] 🚀 Start job`);
+  // Example: map episode_id + quality to m3u8 URL
+  const m3u8Url = `https://example.com/episodes/${episode_id}/${quality}.m3u8`;
+  let subtitlePath = null;
 
-  try {
-    const stream = m3u8stream(url, { maxRetries: 5, retryDelay: 2000 });
-
-    let command = ffmpeg(stream);
-
-    // ===== QUALITY PRESETS =====
-    switch (quality) {
-      case "high":
-        command.videoCodec("libx264").audioCodec("aac").outputOptions(["-preset veryfast", "-crf 22"]);
-        break;
-      case "medium":
-        command.videoCodec("libx264").audioCodec("aac").outputOptions(["-preset fast", "-crf 25"]);
-        break;
-      case "low":
-        command.videoCodec("libx264").audioCodec("aac").outputOptions(["-preset ultrafast", "-crf 28"]);
-        break;
-      case "copy":
-        command.outputOptions(["-c copy", "-bsf:a aac_adtstoasc"]);
-        break;
-      default:
-        command.videoCodec("libx264").audioCodec("aac").outputOptions(["-preset veryfast", "-crf 22"]);
+  if (subtitle) {
+    // Download subtitle file if exists
+    try {
+      const subRes = await fetch(`https://example.com/episodes/${episode_id}.srt`);
+      if (subRes.ok) {
+        subtitlePath = path.join(JOBS_DIR, `${jobId}.srt`);
+        const fileStream = fs.createWriteStream(subtitlePath);
+        await new Promise((resolve, reject) => {
+          subRes.body.pipe(fileStream);
+          subRes.body.on("error", reject);
+          fileStream.on("finish", resolve);
+        });
+      }
+    } catch (err) {
+      console.log("Subtitle fetch failed:", err.message);
     }
-
-    // ===== SUBTITLES =====
-    if (subtitle && subtitle_mode === "hard" && subtitle_url) {
-      const subPath = path.join(TMP_DIR, jobId, "sub.srt");
-
-      // download subtitle file first
-      const subData = await fetch(subtitle_url).then((r) => r.text());
-      fs.writeFileSync(subPath, subData);
-
-      command.outputOptions([`-vf subtitles=${subPath}`]);
-    }
-
-    command
-      .on("progress", (p) => {
-        jobs[jobId].progress = Math.floor(p.percent || 0);
-        if (fs.existsSync(output)) jobs[jobId].size = fs.statSync(output).size;
-      })
-      .on("end", () => {
-        jobs[jobId].status = "done";
-        console.log(`[${jobId}] ✅ Done`);
-      })
-      .on("error", (err) => {
-        jobs[jobId].status = "error";
-        console.log(`[${jobId}] ❌ Error: ${err.message}`);
-      })
-      .save(output);
-
-    res.json({ job_id: jobId });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
   }
+
+  // Stream HLS and convert
+  const stream = m3u8stream(m3u8Url);
+
+  ffmpeg(stream)
+    .outputOptions("-c:v libx264", "-preset veryfast", "-c:a aac")
+    .on("progress", (p) => {
+      jobs[jobId].progress = p.percent ? Math.round(p.percent) : jobs[jobId].progress;
+    })
+    .on("end", () => {
+      jobs[jobId].progress = 100;
+      jobs[jobId].status = "done";
+      // If hard subtitles, burn subtitles into video
+      if (subtitle && subtitle_mode === "hard" && subtitlePath) {
+        const tmpFile = outFile.replace(".mp4", "_sub.mp4");
+        ffmpeg(outFile)
+          .input(subtitlePath)
+          .outputOptions("-c:v libx264", "-preset veryfast", "-c:a copy", "-vf subtitles=" + subtitlePath)
+          .save(tmpFile)
+          .on("end", () => {
+            fs.renameSync(tmpFile, outFile);
+          });
+      }
+    })
+    .on("error", (err) => {
+      console.log("Conversion error:", err.message);
+      jobs[jobId].status = "error";
+    })
+    .save(outFile);
+
+  res.json({ job_id: jobId, status: "started" });
 });
 
-// ===== PROGRESS =====
-app.get("/progress/:id", (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).json({ error: "not found" });
-
-  const sizeMB = (job.size / 1024 / 1024).toFixed(2);
-  const sizeGB = (job.size / 1024 / 1024 / 1024).toFixed(2);
-
-  res.json({ status: job.status, progress: job.progress, size_bytes: job.size, size_mb: sizeMB, size_gb: sizeGB });
+// ===== Progress route =====
+app.get("/progress/:jobId", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.json({ error: "job not found" });
+  res.json({ job_id: req.params.jobId, progress: job.progress, status: job.status });
 });
 
-// ===== DOWNLOAD =====
-app.get("/download/:id", (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).json({ error: "not found" });
-  if (job.status !== "done") return res.status(400).json({ error: "not ready", progress: job.progress });
+// ===== Download route =====
+app.get("/download/:jobId", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job || !fs.existsSync(job.filepath)) return res.status(404).json({ error: "file not ready" });
 
-  const stat = fs.statSync(job.file);
-  res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Content-Length", stat.size);
-  res.setHeader("Content-Disposition", `attachment; filename="video_${req.params.id}.mp4"`);
-  fs.createReadStream(job.file).pipe(res);
+  res.download(job.filepath, `video_${req.params.jobId}.mp4`);
 });
 
-// ===== CLEANUP =====
-app.get("/cleanup/:id", (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).json({ error: "not found" });
-
-  try {
-    fs.rmSync(path.dirname(job.file), { recursive: true, force: true });
-    delete jobs[req.params.id];
-    res.json({ status: "deleted" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.listen(PORT, () => console.log(`🚀 HLS Converter running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
