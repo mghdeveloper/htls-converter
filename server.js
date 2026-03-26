@@ -212,36 +212,59 @@ app.get("/download/:id", (req, res) => {
   }
 
   const filePath = job.file;
-
   if (!fs.existsSync(filePath)) {
     return res.json({ error: "file missing" });
   }
 
   const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
 
-  log(req.params.id, `📤 Start download (${stat.size} bytes)`);
+  const range = req.headers.range;
 
-  res.writeHead(200, {
-    "Content-Type": "video/mp4",
-    "Content-Disposition": `attachment; filename="video_${req.params.id}.mp4"`,
-    "Content-Length": stat.size,
-    "Cache-Control": "no-cache"
-  });
+  if (range) {
+    // ===== RANGE REQUEST =====
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
 
-  const stream = fs.createReadStream(filePath);
-  stream.pipe(res);
+    if (start >= fileSize || end >= fileSize) {
+      res.status(416).send("Requested range not satisfiable");
+      return;
+    }
 
-  res.on("close", () => {
-    log(req.params.id, "⚠️ Client closed connection");
-  });
+    const chunkSize = end - start + 1;
+    const stream = fs.createReadStream(filePath, { start, end });
 
-  res.on("finish", () => {
-    log(req.params.id, "✅ Download finished");
-  });
+    res.writeHead(206, {
+      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunkSize,
+      "Content-Type": "video/mp4",
+      "Content-Disposition": `attachment; filename="video_${req.params.id}.mp4"`,
+      "Cache-Control": "no-cache"
+    });
 
-  stream.on("error", err => {
-    log(req.params.id, "❌ Stream error: " + err.message);
-  });
+    stream.pipe(res);
+
+    stream.on("error", err => {
+      log(req.params.id, "❌ Stream error: " + err.message);
+    });
+
+  } else {
+    // ===== FULL FILE =====
+    res.writeHead(200, {
+      "Content-Length": fileSize,
+      "Content-Type": "video/mp4",
+      "Content-Disposition": `attachment; filename="video_${req.params.id}.mp4"`,
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "no-cache"
+    });
+
+    fs.createReadStream(filePath).pipe(res);
+  }
+
+  res.on("close", () => log(req.params.id, "⚠️ Client closed connection"));
+  res.on("finish", () => log(req.params.id, "✅ Download finished"));
 });
 
 // ===== START SERVER =====
