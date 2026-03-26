@@ -42,7 +42,7 @@ async function streamSegmentsToFFmpeg(playlistUrl, ffmpegStdin, id) {
         segmentStream.pipe(ffmpegStdin, { end: false });
         segmentStream.on("end", () => {
           completed++;
-          jobs[id].progress = Math.floor((completed / lines.length) * 80) + "%";
+          jobs[id].progress = Math.floor((completed / lines.length) * 80) + "%"; // first 80% is download
           log(id, `📊 Progress: ${jobs[id].progress}`);
           resolve();
         });
@@ -92,7 +92,6 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
     jobs[id] = { status: "processing", progress: "0%", file: null, error: null };
 
     const outputFile = path.join(dir, "output.mp4");
-
     const ffmpegArgs = [
       "-y",
       "-allowed_extensions", "ALL",
@@ -100,23 +99,25 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
       "-i", "pipe:0"
     ];
 
-    // Subtitle options
+    // ===== SUBTITLE OPTIONS =====
     const subtitlePath = await downloadSubtitle(episode_id, dir, id);
     if (subtitlePath && subtitle_mode === "hard") {
-      ffmpegArgs.push("-vf", `subtitles=${subtitlePath}`, "-c:v", "libx264", "-preset", "veryfast", "-c:a", "copy");
+      ffmpegArgs.push("-vf", `subtitles=${subtitlePath}`);
+      ffmpegArgs.push("-c:v", "libx264", "-preset", "veryfast", "-c:a", "copy");
+    } else if (subtitlePath && subtitle_mode === "soft") {
+      ffmpegArgs.push("-i", subtitlePath, "-c:s", "mov_text", "-map", "0", "-map", "1");
+      ffmpegArgs.push("-c:v", "copy", "-c:a", "copy");
     } else {
       ffmpegArgs.push("-c", "copy");
-    }
-
-    if (subtitlePath && subtitle_mode === "soft") {
-      ffmpegArgs.push("-i", subtitlePath, "-c:s", "mov_text", "-map", "0", "-map", "1");
     }
 
     ffmpegArgs.push(outputFile);
 
     const ffmpeg = spawn("ffmpeg", ffmpegArgs);
     const pass = new PassThrough();
-    ffmpegStdin(pass);
+
+    // PIPE STREAM TO FFMPEG STDIN
+    pass.pipe(ffmpeg.stdin);
 
     ffmpeg.stderr.on("data", d => console.log(`[${id}] FFmpeg: ${d.toString()}`));
 
@@ -129,12 +130,13 @@ async function processJob(id, episode_id, subtitle_mode = "hard") {
       } else {
         jobs[id].status = "error";
         jobs[id].error = `FFmpeg exited ${code}`;
+        log(id, `❌ FFmpeg exited ${code}`);
       }
     });
 
-    // Start streaming segments to FFmpeg
+    // ===== START STREAMING SEGMENTS =====
     await streamSegmentsToFFmpeg(playlistUrl, pass, id);
-    pass.end();
+    pass.end(); // signal ffmpeg that input is finished
 
   } catch (err) {
     jobs[id].status = "error";
