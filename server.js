@@ -3,7 +3,6 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
-import os from "os";
 
 const app = express();
 app.use(express.json());
@@ -15,7 +14,7 @@ function log(id, msg) {
   console.log(`[${id}] ${msg}`);
 }
 
-// ===== DOWNLOAD FILE (STREAM TO DISK) =====
+// ===== DOWNLOAD FILE =====
 async function download(url, file, id, index = "") {
   try {
     log(id, `⬇️ Download ${index} start`);
@@ -39,44 +38,6 @@ async function download(url, file, id, index = "") {
   }
 }
 
-// ===== MEMORY-BASED CONCURRENCY =====
-function getSafeConcurrency(max = 50) {
-  const freeMB = os.freemem() / 1024 / 1024;
-  if (freeMB < 150) return 3;
-  if (freeMB < 300) return 10;
-  if (freeMB < 700) return 25;
-  return max;
-}
-
-// ===== PARALLEL SEGMENT DOWNLOADER =====
-async function downloadSegmentsParallel(segments, id) {
-  const concurrency = getSafeConcurrency(50);
-  let active = 0;
-  let index = 0;
-
-  return new Promise((resolve, reject) => {
-    const next = () => {
-      if (index >= segments.length && active === 0) return resolve();
-
-      while (active < concurrency && index < segments.length) {
-        const s = segments[index++];
-        active++;
-
-        download(s.url, s.file, id, s.index)
-          .then(() => {
-            active--;
-            jobs[id].downloaded++;
-            jobs[id].progress = Math.floor((jobs[id].downloaded / segments.length) * 100) + "%";
-            next();
-          })
-          .catch(err => reject(err));
-      }
-    };
-
-    next();
-  });
-}
-
 // ===== PROCESS JOB =====
 async function processJob(id, episode_id) {
   try {
@@ -88,14 +49,12 @@ async function processJob(id, episode_id) {
     // ===== FETCH MASTER =====
     log(id, "📥 Fetch master.m3u8");
     const master = await (await fetch(masterUrl)).text();
-
     const quality = master.split("\n").find(l => l && !l.startsWith("#"));
     const playlistUrl = new URL(quality, masterUrl).href;
 
     // ===== FETCH PLAYLIST =====
     log(id, "📥 Fetch playlist");
     const playlist = await (await fetch(playlistUrl)).text();
-
     const lines = playlist.split("\n");
 
     let segmentIndex = 0;
@@ -104,18 +63,10 @@ async function processJob(id, episode_id) {
 
     for (let line of lines) {
       if (line.trim() && !line.startsWith("#")) {
-        const segUrl = line.startsWith("http")
-          ? line
-          : new URL(line, playlistUrl).href;
-
+        const segUrl = line.startsWith("http") ? line : new URL(line, playlistUrl).href;
         const local = `${segmentIndex}.ts`;
 
-        segments.push({
-          url: segUrl,
-          file: `${dir}/${local}`,
-          index: segmentIndex
-        });
-
+        segments.push({ url: segUrl, file: `${dir}/${local}`, index: segmentIndex });
         newPlaylist += local + "\n";
         segmentIndex++;
       } else {
@@ -126,10 +77,32 @@ async function processJob(id, episode_id) {
     jobs[id].total = segments.length;
     log(id, `🎬 Total segments: ${segments.length}`);
 
-    // ===== DOWNLOAD SEGMENTS (PARALLEL) =====
-    jobs[id].downloaded = 0;
-    jobs[id].progress = "0%";
-    await downloadSegmentsParallel(segments, id);
+    // ===== PARALLEL DOWNLOAD =====
+    const MAX_PARALLEL = 30;
+    let done = 0;
+
+    async function downloadSegment(s) {
+      try {
+        await download(s.url, s.file, id, s.index);
+        done++;
+        jobs[id].downloaded = done;
+        jobs[id].progress = Math.floor((done / segments.length) * 100) + "%";
+        log(id, `📊 Progress: ${jobs[id].progress}`);
+      } catch (e) {
+        log(id, `❌ Segment ${s.index} failed`);
+        throw e;
+      }
+    }
+
+    async function runInBatches(items, batchSize, fn) {
+      for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        await Promise.allSettled(batch.map(fn));
+      }
+    }
+
+    log(id, `⚡ Start parallel download with max ${MAX_PARALLEL}`);
+    await runInBatches(segments, MAX_PARALLEL, downloadSegment);
 
     // ===== SAVE LOCAL PLAYLIST =====
     const localM3U8 = `${dir}/local.m3u8`;
@@ -138,7 +111,6 @@ async function processJob(id, episode_id) {
     // ===== DOWNLOAD SUBTITLE =====
     const subtitleUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/english.vtt`;
     const subtitlePath = `${dir}/sub.vtt`;
-
     let hasSubtitle = true;
 
     try {
@@ -162,7 +134,6 @@ async function processJob(id, episode_id) {
 
       if (hasSubtitle && fs.existsSync(subtitlePath)) {
         args.push("-i", subtitlePath);
-
         args.push(
           "-map", "0:v",
           "-map", "0:a",
@@ -208,8 +179,6 @@ async function processJob(id, episode_id) {
 }
 
 // ===== ROUTES =====
-
-// START
 app.post("/convert", (req, res) => {
   const id = Date.now().toString();
   const { episode_id } = req.body;
@@ -228,23 +197,16 @@ app.post("/convert", (req, res) => {
   res.json({ id });
 });
 
-// PROGRESS
 app.get("/progress/:id", (req, res) => {
   res.json(jobs[req.params.id] || { error: "not found" });
 });
 
-// DOWNLOAD
 app.get("/download/:id", (req, res) => {
   const job = jobs[req.params.id];
 
-  if (!job || job.status !== "done") {
-    return res.json({ error: "not ready" });
-  }
-
+  if (!job || job.status !== "done") return res.json({ error: "not ready" });
   const filePath = job.file;
-  if (!fs.existsSync(filePath)) {
-    return res.json({ error: "file missing" });
-  }
+  if (!fs.existsSync(filePath)) return res.json({ error: "file missing" });
 
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
@@ -283,7 +245,6 @@ app.get("/download/:id", (req, res) => {
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-cache"
     });
-
     fs.createReadStream(filePath).pipe(res);
   }
 
