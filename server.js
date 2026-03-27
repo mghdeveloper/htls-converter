@@ -18,19 +18,16 @@ function log(id, msg) {
 async function download(url, file, id, index = "") {
   try {
     log(id, `⬇️ Download ${index} start`);
-
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const stream = fs.createWriteStream(file);
-
     await new Promise((resolve, reject) => {
       res.body.pipe(stream);
       res.body.on("error", reject);
       stream.on("finish", resolve);
       stream.on("error", reject);
     });
-
     log(id, `✅ Download ${index} done`);
   } catch (err) {
     log(id, `❌ Download ${index} failed: ${err.message}`);
@@ -39,33 +36,50 @@ async function download(url, file, id, index = "") {
 }
 
 // ===== PROCESS JOB =====
-async function processJob(id, episode_id) {
+async function processJob(id, episode_id, qualityHeight) {
   try {
     const dir = `./tmp/${id}`;
     fs.mkdirSync(dir, { recursive: true });
 
     const masterUrl = `https://kiroflix.cu.ma/generate/episodes/${episode_id}/master.m3u8`;
 
-    // ===== FETCH MASTER =====
     log(id, "📥 Fetch master.m3u8");
     const master = await (await fetch(masterUrl)).text();
-    const quality = master.split("\n").find(l => l && !l.startsWith("#"));
-    const playlistUrl = new URL(quality, masterUrl).href;
+
+    // ===== PARSE VARIANTS =====
+    const lines = master.split("\n");
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith("#EXT-X-STREAM-INF")) {
+        const info = lines[i];
+        const url = lines[i + 1];
+        const match = info.match(/RESOLUTION=\d+x(\d+)/);
+        const height = match ? parseInt(match[1], 10) : null;
+        variants.push({ info, url: new URL(url, masterUrl).href, height });
+      }
+    }
+
+    // ===== SELECT QUALITY =====
+    let selected = variants[0]; // fallback
+    if (qualityHeight) {
+      const found = variants.find(v => v.height === parseInt(qualityHeight, 10));
+      if (found) selected = found;
+    }
+    log(id, `🎚 Selected quality: ${selected.height}px`);
 
     // ===== FETCH PLAYLIST =====
     log(id, "📥 Fetch playlist");
-    const playlist = await (await fetch(playlistUrl)).text();
-    const lines = playlist.split("\n");
+    const playlist = await (await fetch(selected.url)).text();
+    const playlistLines = playlist.split("\n");
 
     let segmentIndex = 0;
     let newPlaylist = "";
     const segments = [];
 
-    for (let line of lines) {
+    for (let line of playlistLines) {
       if (line.trim() && !line.startsWith("#")) {
-        const segUrl = line.startsWith("http") ? line : new URL(line, playlistUrl).href;
+        const segUrl = line.startsWith("http") ? line : new URL(line, selected.url).href;
         const local = `${segmentIndex}.ts`;
-
         segments.push({ url: segUrl, file: `${dir}/${local}`, index: segmentIndex });
         newPlaylist += local + "\n";
         segmentIndex++;
@@ -80,7 +94,6 @@ async function processJob(id, episode_id) {
     // ===== PARALLEL DOWNLOAD =====
     const MAX_PARALLEL = 30;
     let done = 0;
-
     async function downloadSegment(s) {
       try {
         await download(s.url, s.file, id, s.index);
@@ -150,11 +163,7 @@ async function processJob(id, episode_id) {
       args.push(`${dir}/output.mp4`);
 
       const ff = spawn("ffmpeg", args);
-
-      ff.stderr.on("data", d => {
-        console.log(`[${id}] FFmpeg: ${d.toString()}`);
-      });
-
+      ff.stderr.on("data", d => console.log(`[${id}] FFmpeg: ${d.toString()}`));
       ff.on("close", code => {
         if (code === 0) {
           log(id, "✅ FFmpeg done");
@@ -181,7 +190,7 @@ async function processJob(id, episode_id) {
 // ===== ROUTES =====
 app.post("/convert", (req, res) => {
   const id = Date.now().toString();
-  const { episode_id } = req.body;
+  const { episode_id, quality } = req.body;
 
   jobs[id] = {
     status: "processing",
@@ -192,8 +201,7 @@ app.post("/convert", (req, res) => {
     error: null
   };
 
-  processJob(id, episode_id);
-
+  processJob(id, episode_id, quality);
   res.json({ id });
 });
 
@@ -203,8 +211,8 @@ app.get("/progress/:id", (req, res) => {
 
 app.get("/download/:id", (req, res) => {
   const job = jobs[req.params.id];
-
   if (!job || job.status !== "done") return res.json({ error: "not ready" });
+
   const filePath = job.file;
   if (!fs.existsSync(filePath)) return res.json({ error: "file missing" });
 
@@ -216,11 +224,6 @@ app.get("/download/:id", (req, res) => {
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-    if (start >= fileSize || end >= fileSize) {
-      res.status(416).send("Requested range not satisfiable");
-      return;
-    }
 
     const chunkSize = end - start + 1;
     const stream = fs.createReadStream(filePath, { start, end });
@@ -236,7 +239,6 @@ app.get("/download/:id", (req, res) => {
 
     stream.pipe(res);
     stream.on("error", err => log(req.params.id, "❌ Stream error: " + err.message));
-
   } else {
     res.writeHead(200, {
       "Content-Length": fileSize,
@@ -252,7 +254,4 @@ app.get("/download/:id", (req, res) => {
   res.on("finish", () => log(req.params.id, "✅ Download finished"));
 });
 
-// ===== START SERVER =====
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("🚀 Server running on port", PORT));
